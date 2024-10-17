@@ -25,6 +25,59 @@ import pandas as pd
 warnings.simplefilter('ignore', category=AstropyWarning)
 
 
+class DataFile:
+    """
+    A single fits file in the dataset and it's properties.
+    
+    Methods:
+    --------
+    __init__ - Create an instance
+    get_type - Determine the data type
+    
+    Attributes:
+    -----------
+    name : str;
+        Name of the file.
+        
+    date : str;
+        Date on which the file was taken.
+    
+    chip_id : str;
+        ID of the chip the data is read from.
+        
+    type : str;
+        Type of data e.g. science, acquisition, bias, flat, arc, slit image, image
+    """
+    def __init__(self, fname):
+        self.name = fname
+        self.date = self.name.split('/')[-1][6:16]
+        self.get_type()
+        
+    def get_type(self):
+        """ Identify what type of image is in the file. """
+        header = fits.getheader(self.name)
+        self.chip_id = header['EXTNAME']
+        
+        type = header['ESO DPR TYPE']
+        if type == 'SKY':
+            if header['ESO DPR CATG'] == 'ACQUISITION':
+                self.type = 'acquisition'
+            else:
+                self.type = 'science'
+        elif type == 'BIAS':
+            self.type = 'bias'
+        elif type == 'FLAT,LAMP' or type=='FLAT,SKY':
+            self.type = 'flat'
+        elif type == 'WAVE,LAMP':
+            self.type = 'arc'
+        elif type == 'SLIT':
+            self.type = 'slit'
+        elif type == 'OBJECT':
+            self.type = 'image'
+        else:
+            print(self.name)
+            self.type = 'None'
+
 class Source:
     """
     Data and methods associated with a single source in the data.
@@ -1825,6 +1878,38 @@ def make_bins(sources, edges=None, bin_size=100, line=None, offset=0, centre=Non
     else:
         return wave_bins, flux_bins
 
+def sort_files(data_path, out_path=None):
+    """
+    Sort raw data files into lists of science, bias, flat, arc and slit images.
+    
+    Parameters:
+    -----------
+    data_path : str;
+        Location of the data files.
+    
+    out_path : str, optional;
+        Location where the lists are written to. If not provided, defaults ot a 'file_lists' folder in the data_path.
+    """
+    if not out_path:
+        out_path = f'{data_path}/file_lists'
+    if not os.path.exists(out_path):
+        os.mkdir(out_path)
+    
+    fits_list = np.array(sorted(glob.glob(f'{data_path}/[!M.]*.fits')))
+    
+    data_list = []
+    for f in fits_list:
+        data_list += [DataFile(f)]
+    
+    chips = set([data.chip_id for data in data_list])
+    dates = set([data.date for data in data_list])
+    for c in chips:
+        for d in dates:
+            spec_files = [data for data in data_list if data.chip_id==c and data.date==d]
+            for type in ['science','bias','flat','arc','slit']:
+                file_names = [data.name for data in spec_files if data.type==type]
+                if len(file_names) != 0:
+                    np.savetxt(f'{out_path}/{type}_images_{d}_{c}.txt', file_names, fmt='%s')
 
 #"""
 # Information about the data, to be input by the user
