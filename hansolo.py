@@ -1,9 +1,9 @@
 import sys
+import os
 import glob
 import pickle
 import time
 import gc
-from multiprocessing import Pool #Added for cluster
 
 import numpy as np
 from astropy.io import fits
@@ -17,13 +17,12 @@ import scipy
 import scipy.signal
 from scipy.optimize import least_squares
 from matplotlib import pyplot as plt
-import lacosmic_copy as lacosmic
+import lacosmic
 import warnings
 from barycorrpy import utc_tdb
 import pandas as pd
 
 warnings.simplefilter('ignore', category=AstropyWarning)
-
 
 class DataFile:
     """
@@ -78,6 +77,718 @@ class DataFile:
             print(self.name)
             self.type = 'None'
 
+class Image:
+    """
+    An image from the dataset and its properties.
+    
+    Methods:
+    --------
+    __init__ - create an instance
+    is_bias - check if it's a bias frame
+    get_border - get the width of the border
+    get_detector parameters - get information on the detector
+    get_slit_width - calculate slit widths from header
+    get_slit_params - get slit information
+    update_slits - update slit information
+    copy_slits - copy slit information from another image
+    find_bg - find the average value outside the slits
+    get_slit_borders - get the borders of the slits
+    make_slit_map - create a boolean map of where the slits are
+    set_dark - set the background outside the slits to a fixed value
+    adjust_image - do over/underscan correction and remove the border
+    copy - copy the image to another instance
+    get_wavelengths - obtain the nominal wavelengths from a reference
+    click_plot - clickable plot for wavelength calibration
+    new_solution - update the existing wavelength solution
+    fit_line - fit the position of a line
+    fitted_wavelengths - get parameters of accurately identified lines
+    plot_window - plot a part of the spectrum
+    polyfit_lines - fit a polynomial to a reference line
+    interp_rows - interpolate over data to fill missing row
+    find_wavelength_solution - obtain a wavelength solution for the image
+    adjust_2d - interpolate the image to the nominal wavelengths
+    combine_data - combine images
+    
+    Attributes:
+    -----------
+    name : str;
+        Name of the file the image was read from.
+        
+    data, header : 2D ndarray and fits header
+        Information from the fits file the image was read from.
+        
+    grism : str;
+        Filter in which data was taken.
+        
+    image_type : str;
+        Type of image. Bias, flat, arc or science.
+    
+    chip, chip_ind : str, int;
+        Chip identifiers.
+        
+    n_x, n_y : int;
+        Image size.
+        
+    gain, read_noise : float;
+        Gain and read noise of the detector.
+        
+    scan_region, data_region : list;
+        Lists of corners of the over/underscan region and the data containing region.
+        
+    border : int;
+        Width of the border for over/underscan regions.
+        
+    n_slits : int;
+        Number of slits in the image.
+        
+    slit_centers, slit_width : ndarray, float;
+        Slit parameters in units of pixels. Slit width is assumed to be the same for all slits in an image.
+        
+    bg_value : float;
+        Average background outside the slits.
+        
+    adjusted : bool;
+        Weather the image has been corrected for over/underscan or not.
+        
+    slit_map : 2D ndarray;
+        Boolean array the size of the data, indicating wether a pixel is located in a slit or not.
+    
+    lower_bounds, upper_bounds : list;
+        Lists of arrays with the lower and upper bounds of the slits in the image.
+        
+    wavelength_solution : 2D ndarray;
+        Wavelengths corresponding to the pixels in the image.
+    
+    wavelengths : ndarray;
+        Nominal wavelengths.
+    """
+    
+    def __init__(self, fname=None, slit_centers=None):
+        """
+        Initialise an image, setting up data and related attributes.
+        
+        Parameters:
+        -----------
+            fname : str, optional;
+                The file from which the data is read. Default is None.
+                
+            slit_centers : list, optional;
+                The centers of slits on the image. Default is None.
+        """
+        if fname:
+            self.name = fname.split('/')[-1]
+            self.data = fits.getdata(fname)
+            self.header = fits.getheader(fname)
+            self.get_detector_parameters()
+            if not slit_centers and not self.is_bias():
+                self.get_slit_params()
+            if not self.is_bias():
+                self.find_bg()
+    
+    def is_bias(self):
+        """ Checks if the image is a bias image. """
+        if 'bias' in self.name or 'BIAS' in self.image_type:
+            bool = True
+        else:
+            bool = False
+        return bool
+    
+    def get_border(self):
+        """ Retrieves the width of the unilluminated border around the data. """
+        if self.scan_region:
+            self.border = (self.scan_region[1] - self.scan_region[0]) *2
+        elif self.n_x > 3000:
+            self.border = 20
+        else:
+            self.border = 10
+    
+    def get_detector_parameters(self):
+        """ Obtain detector related parameters."""
+        if 'ESO INS GRIS1 NAME' in self.header:
+            self.grism = self.header['ESO INS GRIS1 NAME']
+        if 'master' in self.name:
+            self.image_type = ' '.join(self.name.split('/')[-1].split('_')[:2])
+        else:
+            self.image_type = self.header['ESO DPR TYPE']
+        self.chip = self.header['EXTNAME']
+        self.chip_ind = int(self.chip[-1])
+        
+        self.n_x = self.header['NAXIS1']
+        self.n_y = self.header['NAXIS2']
+        self.gain = self.header['ESO DET OUT1 GAIN']
+        self.read_noise = self.header['ESO DET OUT1 RON']
+    
+        prescanx = self.header['ESO DET OUT1 PRSCX']
+        prescany = self.header['ESO DET OUT1 PRSCY']
+        overscanx = self.header['ESO DET OUT1 OVSCX']
+        overscany = self.header['ESO DET OUT1 OVSCY']
+        overscan_region = [self.n_y-overscany, self.n_y, overscanx, self.n_x-overscanx]
+        prescan_region = [0, prescany, prescanx, self.n_x-prescanx]
+        if self.chip == 'CHIP1':
+            self.scan_region = prescan_region
+        else:
+            self.scan_region = overscan_region
+        self.data_region = [overscany, self.n_y-overscany, 0, self.n_x]
+        self.get_border()
+        
+    def get_slit_width(self):
+        """ Get the width of the slits in the image. """
+        pixel_scale = self.header['ESO INS PIXSCALE']
+        for i in range(1,9):
+            width_as = self.header[f'ESO INS MOS10{i} LEN']
+            if width_as != 0.50:
+                width_px = width_as/pixel_scale
+        self.slit_width = width_px
+    
+    def get_slit_params(self):
+        """ Get the y coordinates of the centers, the width and the number of slits present in an image. """
+        y_intensity = np.sum(self.data, axis=1).astype(np.float32)
+        med_val = np.median(y_intensity[20:-20])
+        std_val = np.std(y_intensity[20:-20])
+        y_intensity[:20] = med_val
+        y_intensity[-20:] = med_val
+        
+        centers = []
+        sig = 7
+        threshold = med_val + sig*std_val
+        bright_rows = np.where(y_intensity > threshold)[0]
+        while len(bright_rows) > 0:
+            prop_cent = np.nanargmax(y_intensity)
+            if y_intensity[prop_cent-1] > threshold and y_intensity[prop_cent+1] > threshold:
+                centers += [prop_cent]
+                y_intensity[centers[-1]-150:centers[-1]+151] = med_val
+            else:
+                y_intensity[prop_cent] = med_val
+                
+            med_val = np.nanmedian(y_intensity)
+            std_val = np.nanstd(y_intensity)
+            threshold = med_val + sig*std_val
+            bright_rows = np.where(y_intensity > med_val+sig*std_val)[0]
+            
+        self.n_slits = len(centers)
+        self.slit_centers = centers
+        self.get_slit_width()
+        
+    def update_slits(self, slit_centers, slit_width, replace=True):
+        """ Replace or add to slit parameters. """
+        if replace:
+            self.slit_centers = slit_centers
+            self.slit_width = slit_width
+        else:
+            self.slit_centers = self.slit_centers + slit_centers
+            self.slit_width = np.median([self.slit_width, slit_width])
+        self.n_slits = len(self.slit_centers)
+        
+    def copy_slits(self, source_image):
+        """ Copy slit parameters from another image. """
+        self.slit_map = source_image.slit_map
+        self.update_slits(source_image.slit_centers, source_image.slit_width)
+        if hasattr(source_image, 'lower_bounds'):
+            self.lower_bounds = source_image.lower_bounds
+            self.upper_bounds = source_image.upper_bounds
+            #self.slit_bounds = source_image.slit_bounds
+        
+    def find_bg(self):
+        """ Calculate average background outside of slits. """
+        y_inds = np.ones(self.n_y)
+        y_inds[:self.border] = 0
+        y_inds[-self.border:] = 0
+        for i in range(self.n_slits):
+            lower_bound = self.slit_centers[i] - self.slit_width/2 - 30
+            upper_bound = self.slit_centers[i] + self.slit_width/2 + 30
+            slit_inds = np.arange(lower_bound, upper_bound, dtype=int)
+            y_inds[slit_inds] = 0
+            
+        data_copy = np.copy(self.data)
+        data_copy[y_inds==0] = 0
+        self.bg_value = np.median(self.data[np.where(y_inds!=0)])
+        
+    def get_slit_borders(self, plot=False):
+        """ Get the borders of the slit traces in the image. """
+        box_pars = np.zeros([self.n_x, self.n_slits, 3])
+        for i in range(self.n_slits):
+            if plot:
+                plt.ion()
+            for j in range(self.n_x):
+                col = self.data[:,j]
+                # To isolate a single slit
+                low = int(self.slit_centers[i] - self.slit_width/2) - 50
+                if low > 0:
+                    col[:low] = self.bg_value
+                high = int(self.slit_centers[i] + self.slit_width/2) + 50
+                if high < self.n_y:
+                    col[high:] = self.bg_value
+                box_pars[j, i] = fit_tophat(col, self.slit_centers[i], self.slit_width, plot=plot, title=f'Column {j}')
+            if plot:
+                plt.close()
+                plt.ioff()
+            
+            box_pars[:,:,2][box_pars[:,:,2] < 1] = np.nan
+            x_inds = np.arange(self.n_x)
+            for j in range(3):
+                clipped = stats.sigma_clip(box_pars[:,i,j], sigma=5, masked=True)
+                box_pars[:,i,j] = clipped.filled(np.nanmedian(box_pars[:,i,j]))
+                spl_func = scipy.interpolate.UnivariateSpline(x_inds, box_pars[:,i,j])
+                if plot:
+                    plt.scatter(x_inds, box_pars[:,i,j], marker='.')
+                    plt.plot(x_inds, spl_func(x_inds), color='r')
+                    plt.title(['lower bound', 'upper bound', 'amplitude'][j])
+                    plt.show(block=False)
+                    plt.pause(3)
+                    plt.close()
+                    plt.clf()
+                box_pars[:,i,j] = spl_func(x_inds)
+                
+        self.lower_bounds = box_pars[:,:,0]
+        self.upper_bounds = box_pars[:,:,1]
+        self.slit_bounds = [[box_pars[:,s,0], box_pars[:,s,1]] for s in range(self.n_slits)]
+    
+    def make_slit_map(self):
+        """ Make a boolean map of which pixels are in the slit. """
+        y_inds = np.arange(self.n_y)
+        self.slit_map = np.zeros(self.data.shape)
+        for i in range(self.n_x):
+            for j in range(self.n_slits):
+                self.slit_map[(y_inds>self.lower_bounds[i,j]) & (y_inds<self.upper_bounds[i,j]), i] = 1
+
+    def set_dark(self, dark=0):
+        """ Set pixels outside the slits to the value of 'dark'. """
+        with0 = np.copy(self.data)
+        with0[self.slit_map == 0] = dark
+        self.data = with0
+        
+    def adjust_image(self):
+        """ Correct for borders and over/underscan regions. """
+        if not hasattr(self, 'adjusted'):
+            scan_region = self.data[self.scan_region[0]:self.scan_region[1], self.scan_region[2]:self.scan_region[3]]
+            scan_mean = robust.mean(scan_region)
+            data_only = self.data[self.data_region[0]:self.data_region[1], self.data_region[2]:self.data_region[3]]
+            data_only = data_only - scan_mean
+            self.data = data_only
+            self.adjusted = True
+            self.n_y -= self.border
+        else:
+            print('This image has already been adjusted.')
+            
+    def copy(self):
+        """ Make a copy of the current instance. """
+        copy_image = Image()
+        key_list = vars(self).keys()
+        for key in key_list:
+            if type(vars(self)[key]) == np.ndarray:
+                vars(copy_image)[key] = vars(self)[key].copy()
+            else:
+                vars(copy_image)[key] = vars(self)[key]
+        return copy_image
+    
+    def get_wavelengths(self, grism_file):
+        """ Get nominal wavelengths from a reference file. """
+        wmin, wmax, wstep = get_grism_parameters(grism_file)
+        self.wavelengths = np.arange(wmin, wmax+wstep/2, wstep)
+    
+    def click_plot(self, index, click_bool):
+        """
+        Show wavelength calibration plot and either identifies calibration lines by taking the closest line over the threshold for automatic calibration or prompts the user to click the indicated line for manual wavelength calibration.
+        
+        Parameters:
+        -----------
+        index : int;
+            Index of the line to be selected.
+            
+        click_bool : bool, optional;
+            If True, manual calibration is done. Else automatic calibration. Default is False.
+        """
+        #waves, rough_spec, line_waves, click_lines[j], threshold=threshold, click_bool=manual_mode
+        if click_bool:
+            print('Click the line at',self.click_lines[index],'Å, or left of the data if line not shown')
+            fig = plt.figure()
+            fig.set_size_inches(10,5)
+            ax = fig.add_subplot(111)
+            ax.plot(self.wavelengths, self.spectrum, color='k')
+            ax.scatter(self.line_waves, np.zeros(len(self.line_waves)), marker='x', color='r')
+            ax.axvline(self.click_lines[index], zorder=-10)
+            cid = fig.canvas.mpl_connect('button_press_event', onclick)
+            plt.show()
+        else:
+            line_inds = np.where(self.spectrum > self.threshold)[0]
+            oldxval = np.argmin( np.abs(self.wavelengths - self.click_lines[index]) )
+            newxval = np.argmin( np.abs(line_inds - oldxval) )
+            self.line_xvals.append( self.wavelengths[line_inds[newxval]] )
+    
+    def new_solution(self, current_x, new_x, previous_solution, inds=None, plot=False):
+        """ Update the wavelength solution. """
+        if inds is not None:
+            if type(current_x)==list or type(new_x)==list:
+                current_x = np.array(current_x)
+                new_x = np.array(new_x)
+            cs = robust_fit(current_x[inds], new_x[inds], 4)
+            if plot:
+                plt.scatter(current_x[inds], new_x[inds], color='k')
+        else:
+            cs = robust_fit(current_x, new_x)
+            if plot:
+                plt.scatter(current_x, new_x, color='k')
+        
+        solution = np.polyval(cs, previous_solution)
+        if plot:
+            highres_x = np.linspace(current_x[0], current_x[-1], 1000)
+            plt.plot(highres_x, np.polyval(cs, highres_x),color='r')
+            plt.show(block=False)
+            plt.pause(2)
+            plt.close()
+            plt.clf()
+        
+            plt.plot(solution, self.spectrum, color='k')
+            [plt.axvline(l, color='green', zorder=-1) for l in new_x]
+            plt.show(block=False)
+            plt.pause(5)
+            plt.close()
+            plt.clf()
+            
+        return solution
+            
+        #xval_array[i], click_lines, waves, rough_spec, inds=good_inds, plot=True
+    
+    def fit_line(self, index, peak_width, manual_mode):
+        """ Fit a line on the detector to obtain the center location. """
+        self.click_plot(index, click_bool=manual_mode)
+        wmin = self.wavelengths[0]
+        wmax = self.wavelengths[-1]
+        if self.line_xvals[index] < wmin or self.line_xvals[index] > wmax:
+            self.line_xvals[index] = np.nan
+            return 0
+        else:
+            x_inds = np.where((self.wavelengths > self.line_xvals[index] - peak_width) & (self.wavelengths < self.line_xvals[index] + peak_width))
+            fit = fit_moffat(self.wavelengths[x_inds], self.spectrum[x_inds], plot=True)
+            return fit.x_0.value
+    
+    def fitted_wavelengths(self, spectrum, window_width, manual, plot_bool=False, mode='valid'):
+        """ Get the parameters of lines that have been accurately identified in the calibration image.
+        
+        Parameters:
+        -----------
+        spectrum : ndarray;
+            Calibration spectrum fluxes.
+            
+        window_width : int;
+            Width of region around the line where the fit is performed.
+            
+        manual : bool;
+            If True, calibration is done manually. If False, it is doen automatically.
+            
+        plot_bool : bool, optional;
+            If True, print progress statements.
+            
+        mode : str, optional;
+            If 'valid', badly fit lines are ignored. If 'same' they are included as NaNs.
+        """
+        fitted_x = []
+        fitted_l = []
+        for i in range(len(self.line_waves)):
+            ind_guess = np.argmin( np.abs(self.solution - self.line_waves[i]) )
+            x_guess = self.solution[ind_guess]
+            x_inds = np.where( (self.solution > x_guess-window_width) & (self.solution < x_guess+window_width) )
+            fit = fit_moffat(self.solution[x_inds], spectrum[x_inds], plot=plot_bool)
+            success = check_line_fit(fit, self.solution[x_inds[0][0]], self.solution[x_inds[0][-1]], 1e3, manual)
+            if success:
+                fitted_x = fitted_x + [fit.x_0.value]
+                fitted_l = fitted_l + [self.line_waves[i]]
+                if plot_bool:
+                    print(f'Line at {str(int(np.round(self.line_waves[i])))} Å added.')
+            elif mode=='same':
+                fitted_x = fitted_x + [np.nan]
+                fitted_l = fitted_l + [np.nan]
+                if plot_bool:
+                    print(f'Line at {str(int(np.round(self.line_waves[i])))} Å skipped.')
+            elif plot_bool:
+                print(f'Line at {str(int(np.round(self.line_waves[i])))} Å skipped.')
+        return fitted_x, fitted_l
+        
+    #first_solution, cut_lines, rough_width, rough_spec, manual_mode, print_status=True
+    
+    def plot_window(self):
+        """ Plot segments of the spectrum from the start to the end of the wavelength range. """
+        maxval = 0
+        i = 0
+        plt.ion()
+        while maxval < np.max(self.solution):
+            minval = np.min(self.solution) + 50*i
+            maxval = minval + 50
+            plt.plot(self.solution, self.spectrum, color='k')
+            [plt.axvline(l, color='green', zorder=-1) for l in self.line_waves]
+            plt.xlim([minval, maxval])
+            plt.pause(.1)
+            plt.clf()
+            i += 1
+        plt.close()
+        plt.ioff()
+            
+        #second_solution, rough_spec, lvals
+    
+    def polyfit_lines(self, all_lines, complete_rows):
+        """ Fit a polynomial to the line traces on the detector.
+        
+        Parameters:
+        -----------
+        all_lines : list;
+            X positions of the lines for each row.
+        
+        complete_rows : ndarray;
+            Y indices of the rows which are completely in the slit.
+        """
+        n_lines = len(self.line_waves)
+        yfit_lines = np.zeros(all_lines.shape)
+        sigs = np.zeros(n_lines)
+        
+        plt.ion()
+        for i in range(n_lines):
+            inds = np.where(np.isfinite(all_lines[complete_rows, i]))
+            if len(inds[0]) > len(all_lines[complete_rows, i])/2:
+                cs = robust_fit(complete_rows[inds], all_lines[complete_rows,i][inds], 3)
+                yfit_lines[complete_rows,i] = np.polyval(cs, complete_rows)
+                diff = yfit_lines[complete_rows,i]-all_lines[complete_rows,i]
+                sigs[i] = robust.std(diff[np.isfinite(diff)])
+                #plt.scatter(all_lines[:,i],np.arange(self.n_y),color='k')
+                plt.scatter(all_lines[complete_rows, i], complete_rows, color='k')
+                plt.plot(yfit_lines[complete_rows,i], complete_rows, color='r')
+                plt.title(f'Arc line {i} fit in the y direction')
+                #plt.show(block=False)
+                plt.pause(.1)
+                #plt.close()
+                plt.clf()
+        plt.close()
+        plt.ioff()
+        
+        clean_line_inds = np.where(sigs < 2*np.nanmedian(sigs))
+        return clean_line_inds
+        
+    def interp_rows(self, bad_rows):
+        """ If a row is not fit properly, interpolate from the closest rows above and below. """
+        for i in range(len(bad_rows)):
+            row_up = bad_rows[i]+1
+            row_above = self.wavelength_solution[row_up]
+            while np.sum(row_above) == 0:
+                row_up += 1
+                row_above = self.wavelength_solution[row_up]
+            row_lo = bad_rows[i]-1
+            row_below = self.wavelength_solution[row_lo]
+            while np.sum(row_below) == 0:
+                row_lo -= 1
+                row_below = self.wavelength_solution[row_lo]
+            self.wavelength_solution[bad_rows[i]] = np.mean([row_below, row_above], axis=0)
+    
+    
+    def find_wavelength_solution(self, line_file, grism_file, manual_mode=False, custom_line_list=None):
+        """
+        Create a wavelength solution for the calibration file.
+        A first solution is found based on a number of lines listed in the calibration file that can be identified either automatically or manually in the calibration spectrum.
+        This solution is further improved by fitting all the lines in the spectrum and then iterated over.
+        
+        Parameters:
+        -----------
+        line_file : str;
+            Calibration file that has a list of identified lines.
+            
+        grism_file : str;
+            File containing the grism table.
+            
+        manual_mode : bool, optional;
+            If True, calibrations are done manually. If False, they are done automatically. Default is False.
+        
+        custom_list : str, optional;
+            File containing a custom list of identifiable lines, to be used instead of ones specified in this function. Default is None.
+        """
+        self.wavelength_solution = np.zeros(self.data.shape)
+        wmin, wmax, wstep = get_grism_parameters(grism_file)
+        self.wavelengths = wmin + np.arange(self.n_x) * wstep
+        self.line_waves, line_ions, line_sets = get_line_parameters(line_file)
+        # Lines used for first iteration of the wavelength calibration:
+        self.click_lines, self.threshold = wave_id_lines(self.grism, custom_line_list)
+        n_lines = len(self.click_lines)
+        
+        guess_range = 20
+        peak_width = 30
+        xval_array = np.zeros([self.n_slits, n_lines])
+        for i in range(self.n_slits):
+            # Extract the spectrum from the data
+            spec_guess_area = self.data[int(self.slit_centers[i] - guess_range/2) : int(self.slit_centers[i] + guess_range/2)]
+            self.spectrum = robust.mean(spec_guess_area, 5., axis=0)
+            self.error = np.sqrt(self.spectrum / guess_range)
+            plt.plot(self.wavelengths, self.spectrum, color='k')
+            plt.axhline(self.threshold, color='green')
+            [plt.axvline(c, color='green') for c in self.click_lines]
+            plt.show(block=False)
+            plt.pause(5)
+            plt.close()
+            plt.clf()
+            
+            # Obtain first iteration of the wavelength solution.
+            self.line_xvals = []
+            for j in range(n_lines):
+                    xval_array[i,j] = self.fit_line(j, peak_width, manual_mode)
+            good_inds = np.where( (xval_array[i]>wmin) & (xval_array[i]<wmax) )[0]
+            self.solution = self.new_solution(xval_array[i], self.click_lines, self.wavelengths, inds=good_inds)
+            # If the solution didn't work, try again, but manually.
+            while( np.any(self.solution)<=0 or np.min(self.solution)<wmin-2000 ):
+                print('Wavelength calibration has failed. Please select the following lines by hand:')
+                for j in range(n_lines):
+                    print(self.click_lines[j])
+                    xval_array[i,j] = self.fit_line(j, peak_width, manual_mode=True)
+                good_inds = np.where( (xval_array[i]>wmin) & (xval_array[i]<wmax) )[0]
+                self.solution = self.new_solution(xval_array[i], self.click_lines, self.wavelengths, inds=good_inds)
+            
+            # Get the second iteration based on applying the first to all the available lines.
+            line_inds = np.where((self.line_waves > self.solution[0]) & (self.line_waves < self.solution[-1]))
+            self.line_waves = self.line_waves[line_inds]
+            xvals, lvals = self.fitted_wavelengths(self.spectrum, guess_range, manual_mode, plot_bool=True)
+            self.solution = self.new_solution(xvals, lvals, self.solution)
+            self.plot_window()
+            
+            # Select the data in the area around the slit.
+            lower_guess = int(self.slit_centers[i] - self.slit_width/2 - guess_range)
+            upper_guess = int(self.slit_centers[i] + self.slit_width/2 + guess_range)
+            # Identify rows wich only/partially contain slit data.
+            row_counts = np.sum(self.slit_map[lower_guess:upper_guess], axis=1)
+            complete_rows = np.where(row_counts == self.n_x)[0] + lower_guess
+            partial_rows = np.where((row_counts!=0) & (row_counts!=self.n_x))[0] + lower_guess
+            n_complete = len(complete_rows)
+            n_partial = len(partial_rows)
+            print('Complete rows:',n_complete)
+            
+            # Calculate the positions of the lines in each complete row.
+            line_positions = np.zeros([n_complete, len(self.line_waves)])
+            all_lines = np.zeros([self.n_y, len(self.line_waves)])
+            for j in range(n_complete):
+                row = self.data[complete_rows[j]]
+                line_positions[j], new_lvals = self.fitted_wavelengths(row, guess_range, manual_mode, mode='same')
+                print(f'{j+1}/{n_complete}',end='\r')
+                if len(line_positions[j][np.isfinite(line_positions[j])] > len(line_positions[j]/2)):
+                    valid_inds = np.where(np.isfinite(line_positions[j]))
+                    valid_pos = line_positions[j][valid_inds]
+                    valid_lvals = np.array(new_lvals)[valid_inds]
+                    line_solution = self.new_solution(valid_pos, valid_lvals, self.solution)
+                all_lines[complete_rows[j]] = line_positions[j]
+                self.wavelength_solution[complete_rows[j]] = line_solution
+            
+            # Set out of slit and failed wavelength calibrations to NaNs
+            self.wavelength_solution[self.wavelength_solution==0] = np.nan
+            clean_inds = self.polyfit_lines(all_lines, complete_rows)
+            
+            # Obtain a final solution for each complete row.
+            bad_rows = []
+            for j in complete_rows:
+                if np.sum(np.isfinite(all_lines[j])) > 5: #< len(all_lines[j])/2:
+                    self.wavelength_solution[j] = self.new_solution(all_lines[j], self.line_waves, self.wavelength_solution[j])
+                else:
+                    self.wavelength_solution[j] = 0
+                    bad_rows = bad_rows + [j]
+            
+            # Interpolate missed rows if necessary.
+            if len(bad_rows) == 0:
+                print('Finding a wavelength solution was succesful for all rows.')
+            else:
+                print(f'Finding a wavelength solution was unsuccesful for {len(bad_rows)} out of {n_complete} rows: {bad_rows} \n Interpolating a solution for the missing rows.')
+                self.interp_rows(bad_rows)
+            
+            # Extend the solution to partial rows.
+            for j in range(self.n_x):
+                good_inds = np.where(self.wavelength_solution[complete_rows,j] != 0)
+                cs = robust_fit(complete_rows[good_inds], self.wavelength_solution[complete_rows,j][good_inds], 3)
+                self.wavelength_solution[partial_rows,j] = np.polyval(cs, partial_rows)
+                
+    def adjust_2d(self):
+        """ Interpolate all the rows in the data to match the nominal wavelength solution. """
+        new_data = np.zeros([self.n_y, len(self.wavelengths)])
+        for i in range(self.n_y):
+            good_inds = np.where(np.isfinite(self.wavelength_solution[i]) & np.isfinite(self.data[i]))
+            data_nonan = self.data[i][good_inds]
+            wave_solution_nonan = self.wavelength_solution[i][good_inds]
+            if len(wave_solution_nonan) > self.n_x//2:
+                wmin = self.wavelengths[0]
+                wmax = np.round(self.wavelengths[-1])
+                wstep = np.median(self.wavelengths - np.roll(self.wavelengths,1))
+                new_data[i] = linear_rebin(wave_solution_nonan, data_nonan, wmin=wmin, wmax=wmax, wstep=wstep)
+            else:
+                new_data[i] = np.nan
+        self.data = new_data
+        self.n_x = len(self.wavelengths)
+    
+    def combine_data(self, second_image):
+        """ Combine data from different images. """
+        new_image = self.copy()
+        new_image.data = np.append(self.data, second_image.data, axis=0)
+        new_image.slit_map = np.append(self.slit_map, second_image.slit_map, axis=0)
+        if hasattr(self, 'lower_bounds'):
+            sec_lower = [lb + self.n_y for lb in second_image.lower_bounds]
+            sec_upper = [ub + self.n_y for ub in second_image.upper_bounds]
+            new_image.lower_bounds = np.append(self.lower_bounds, sec_lower, axis=1)
+            new_image.upper_bounds = np.append(self.upper_bounds, sec_upper, axis=1)
+        second_image.slit_centers = [sc+self.n_y for sc in second_image.slit_centers]
+        self.update_slits(second_image.slit_centers, second_image.slit_width, replace=False)
+        self.n_y, self.n_x = new_image.data.shape
+        return new_image
+        
+class Cube:
+    """
+    A data cube made up of different images.
+    
+    Methods:
+    --------
+    __init__ - Create an instance
+    add_frame - Add an image to the cube
+    collapse_cube - combine the cube into a master image.
+    
+    Attributes:
+    -----------
+    nx, ny, nz : int;
+        The shape of the cube.
+        
+    data : 3D ndarray;
+        Data contained in the stacked images.
+        
+    collapsed:
+        Master image made by sigma-clipped averaging over the z-axis of the cube.
+    """
+    
+    def __init__(self, flist):
+        """
+        Create a cube by adding images from the input list.
+        
+        Parameters:
+        -----------
+        flist : list;
+            List of input images.
+        """
+        for f in flist:
+            self.add_frame(f)
+        self.nx = self.data.shape[2]
+        self.ny = self.data.shape[1]
+        self.nz = self.data.shape[0]
+        
+    def add_frame(self, image):
+        """ Correct an image for borders and over/underscan and add it to the cube. """
+        image.adjust_image()
+        frame = image.data
+        if not hasattr(self, 'data'):
+            self.data = np.array([frame])
+        else:
+            self.data = np.append(self.data, [frame], axis=0)
+            
+    def collapse_cube(self, n_excl=3):
+        """ Sigma clipped average of the cube.
+        
+        Parameters:
+        -----------
+        n_excl : int;
+            Number of excluded pixels at the top and bottom of the distribution along the z-axis.
+        """
+        self.data = np.sort(self.data, axis=0)
+        if self.nz > 3*n_excl+1:
+            image = np.mean(self.data[n_excl:-n_excl], axis=0)
+        else:
+            image = np.mean(self.data, axis=0)
+        self.collapsed = image
+
 class Source:
     """
     Data and methods associated with a single source in the data.
@@ -127,7 +838,7 @@ class Source:
         These can be used as detrending parameters when fitting the light curves.
     """
     
-    def __init__(self, images, nx, n_appertures, index, chip, grism_info=None, dumb=False):
+    def __init__(self, images, n_appertures, index, chip, grism_info=None, dumb=False):
         """
         Initialise a Source instance, setting up arrays for fluxes, errors, and other attributes.
 
@@ -135,9 +846,6 @@ class Source:
         -----------
         images : list;
             A list of images from which to extract data.
-            
-        nx : int;
-            Number of pixels or points along the x-axis.
             
         n_appertures : int;
             Number of aperture sizes from which the flux is extracted.
@@ -156,15 +864,16 @@ class Source:
         n_images = len(images)
         if not dumb:
             print('Initialising star '+str(index+1))
+        self.file_list = images
         self.number = index
-        self.chip = chip
-        self.fluxes = np.zeros([n_images, nx, n_appertures])
-        self.flux_errors = np.zeros([n_images, nx, n_appertures])
-        self.qis = np.zeros([n_images, nx])
-        self.fitcens = np.zeros([n_images, nx])
-        self.smocens = np.zeros([n_images, nx])
-        self.fwhms = np.zeros([n_images, nx])
-        self.backgrounds = np.zeros([n_images, nx])
+        self.n_x = fits.getdata(images[0]).shape[1]
+        self.fluxes = np.zeros([n_images, self.n_x, n_appertures])
+        self.flux_errors = np.zeros([n_images, self.n_x, n_appertures])
+        self.qis = np.zeros([n_images, self.n_x])
+        self.fitcens = np.zeros([n_images, self.n_x])
+        self.smocens = np.zeros([n_images, self.n_x])
+        self.fwhms = np.zeros([n_images, self.n_x])
+        self.backgrounds = np.zeros([n_images, self.n_x])
         self.max_values = np.zeros([n_appertures, n_images])#np.zeros([n_images, nx])
         
         self.gain = 0.
@@ -179,8 +888,7 @@ class Source:
         
         if grism_info:
             self.wmin, self.wmax, self.wstep = get_grism_parameters(grism_info)
-            n_steps = np.ceil((self.wmax-self.wmin)/self.wstep)
-            self.wavelengths = self.wmin + self.wstep * np.arange(n_steps)
+            self.wavelengths = self.wmin + self.wstep * np.arange(self.n_x)
     
     def get_header_info(self, file_list):
         """
@@ -202,12 +910,12 @@ class Source:
             jd_utc = 2400000.5+header['MJD-OBS']
             self.bjd[i] = utc_tdb.JDUTC_to_BJDTDB(jd_utc, ra=header['RA'], dec=header['DEC'], lat=header['ESO TEL GEOLAT'], longi=header['ESO TEL GEOLON'], alt=header['ESO TEL GEOELEV'])[0][0]+self.exptime[i]*u.s.to(u.day)/2
             if i == 0:
-                self.gain = header['ESO DET OUT{0} GAIN'.format(self.chip+1)] # Currently only gets read noise and gain from the first chip, need to add it so I can get header info from the second chip.
-                self.ron = header['ESO DET OUT{0} RON'.format(self.chip+1)]
+                self.gain = header[f'ESO DET OUT1 GAIN'] # Currently only gets read noise and gain from the first chip, need to add it so I can get header info from the second chip.
+                self.ron = header[f'ESO DET OUT1 RON']
     
     def copy(self, dumb=False):
         """ Create a copy of the Source instance """
-        copy_star = Source([], 0, 0, self.number, self.chip, dumb=dumb)
+        copy_star = Source([], 0, 0, self.number , dumb=dumb)
         key_list = vars(self).keys()
         for key in key_list:
             if type(vars(self)[key]) == np.ndarray:
@@ -226,7 +934,7 @@ class Source:
         err_photon = np.sqrt(self.fluxes[i,:,k]) #gain is already included in the extracted flux
         err_scint = self.fluxes[i,:,k] * np.sqrt(10 * 1e-6 * C**2 * D**(-4/3) / self.exptime[i] * self.airmass[i]**3 * np.e**(-2*h/H)) #Osborn+ 2015, eq 7
         err_sky = np.sqrt(2*aps[k] * self.backgrounds[i] * self.gain)
-        err_ron = np.sqrt(2*aps[k]) * self.ron #[self.chip]
+        err_ron = np.sqrt(2*aps[k]) * self.ron
         return np.sqrt(err_photon**2 + err_scint**2 + err_sky**2 + err_ron**2)
     
     def clean_flux(self, sig_thr=10, flags=None):
@@ -241,7 +949,7 @@ class Source:
         flags : list, optional;
             List of pixels that need to be cleaned regardless of outlier status.
         """
-        print(f'\nCleaning star {self.number+1}')
+        print(f'\nCleaning star {self.number}')
         n_ims, n_x, n_apertures = self.fluxes.shape
         for i in range(n_x):
             for j in range(n_apertures):
@@ -263,7 +971,7 @@ class Source:
                         self.fluxes[true_bad_inds,i,j] = y_poly[bad_inds]*self.exptime[true_bad_inds]
         self.max_values = np.nanmax(self.fluxes,axis=1)
     
-    def extract(self, file_list, slit_tops, slit_bottoms, skyreg, aps):
+    def extract(self, slit_tops, slit_bottoms, skyreg, aps):
         """
         Extract the spectral flux from the 2D images.
         
@@ -283,11 +991,10 @@ class Source:
         """
         sig_val = 100
         n_aps = len(aps)
-        for i in range(len(file_list)):
-            print('Star {0}/{1}, file {2}/{3} \r'.format( self.number+1, len(slit_tops), i+1, len(file_list) ), end='')
-            data, header = fits.getdata(file_list[i], header=True)
-            j = self.number
-            y_inds = np.arange(np.median(slit_bottoms[j]),np.median(slit_tops[j]),dtype=int)
+        for i in range(len(self.file_list)):
+            print('Star {0}/{1}, file {2}/{3} \r'.format( self.number, len(slit_tops), i+1, len(self.file_list) ), end='')
+            data, header = fits.getdata(self.file_list[i], header=True)
+            y_inds = np.arange(np.median(slit_bottoms),np.median(slit_tops),dtype=int)
             data = data[y_inds]
             sky_inds = np.append(np.arange(skyreg[0],skyreg[1]), np.arange(skyreg[2],skyreg[3]))
             sky = data[sky_inds]
@@ -393,7 +1100,7 @@ class Source:
             If True, prints the original resolution of the model spectrum and the data and shows a plot comparing wavelength solutions before and after alignment. Default is True.
         """
         # Obtain model spectrum and degrade it to the resolution of the data
-        model_wave, model_flux, model_step = get_model(cal_path, self.wmin, self.wmax, print_res=print_res)
+        model_wave, model_flux, model_step = get_model(cal_path, self.wmin, self.wmax, grism, print_res=print_res)
         model_norm = filter_spec(model_wave, model_flux, 2475)#
         interp_func = scipy.interpolate.CubicSpline(model_wave[np.isfinite(model_norm)], model_norm[np.isfinite(model_norm)], extrapolate=False)
         model_norm = interp_func(self.wavelengths)
@@ -409,12 +1116,12 @@ class Source:
                 inds = np.arange(inds[0][0]-window, inds[0][-1]+window+1)
             shifts[i] = ccf(ref_norm[inds],model_norm[inds],window,err=True,plot_bool=print_res)
         if np.nansum(shifts)!=0:
-            cs = np.polyfit(cent, shifts[:,0]*wstep, n_order)#, w=1/shifts[:,1])
+            cs = np.polyfit(cent, shifts[:,0]*self.wstep, n_order)#, w=1/shifts[:,1])
             new_wave = self.wavelengths + np.polyval(cs, self.wavelengths)
             if print_res:
-                plt.errorbar(cent,shifts[:,0]*wstep,yerr=shifts[:,1]*self.wstep,fmt='.')
+                plt.errorbar(cent,shifts[:,0]*self.wstep,yerr=shifts[:,1]*self.wstep,fmt='.')
                 plt.plot(self.wavelengths,new_wave-self.wavelengths)
-                plt.plot(self.wavelengths, np.polyval(np.polyfit(cent,shifts[:,0]*wstep,1), self.wavelengths))
+                plt.plot(self.wavelengths, np.polyval(np.polyfit(cent,shifts[:,0]*self.wstep,1), self.wavelengths))
                 plt.show()
         else:
             new_wave = self.wavelengths
@@ -443,7 +1150,7 @@ class Source:
         print_stuff : bool, optional;
             If True, prints the original resolution of the model spectrum and the data and shows a plot comparing wavelength solutions before and after alignment. Default is True.
         """
-        print(f'Aligning star {self.number+1}')
+        print(f'Aligning star {self.number}')
         n_steps = int(np.ceil((self.wmax-self.wmin)/self.wstep))
         if n_steps != len(self.fluxes[0,:,0]):
             print('CHECK ARRAY LENGTHS')
@@ -458,7 +1165,8 @@ class Source:
         
         self.self_align(ref_ap, ref_im, regs, window, n_order)
         self.model_align(cal_path, grism, ref_im, ref_ap, window, n_order, print_res=print_stuff)
-                    
+
+
 def running_std(data, window=31):
     """
     Calculate the standard deviation over a running window.
@@ -554,9 +1262,9 @@ def filter_spec(waves, spectrum, window):
     
     return spec_norm
     
-def get_model(cal_path, wmin, wmax, print_res=False):
+def get_model(cal_path, wmin, wmax, grism, print_res=False):
     """ Read a model stellar spectrum from the calibration file and degrade it to data resolution. """
-    model_files = sorted(glob.glob(cal_path+'*PHOENIX*'))
+    model_files = sorted(glob.glob(f'{cal_path}/*PHOENIX*'))
     model_wave = fits.getdata(model_files[0])
     model_wave = vac_to_air(model_wave)
     model_flux = fits.getdata(model_files[1])
@@ -715,15 +1423,13 @@ def get_line_parameters(fname):
     set = data['LINE_SET']
     return wave, ion, set
     
-def read_files(path, name, filt, mask, n_lists):
+def read_files(path, data_type, data_set, n_lists):
     """ Read list of file names. """
-    part_path = '/'.join(path.split('/')[:-3])+'/'
     file_lists = [None]*n_lists
     for i in range(n_lists):
-        file_lists[i] = np.loadtxt(path+name+str(i+1)+mask+'.txt',dtype=str)#str(night)+'_'
+        file_lists[i] = np.loadtxt(f'{path}/file_lists/{data_type}_images_{data_set}_CHIP{i+1}.txt',dtype=str)
         if file_lists[i].size == 1:
             file_lists[i] = np.array([file_lists[i]])
-        file_lists[i] = [part_path+f[6:] for f in file_lists[i]]
     return file_lists
     
 def get_border(scan, nx):
@@ -736,46 +1442,6 @@ def get_border(scan, nx):
         border = 10
     return border
     
-def make_mastercube(flist, nx, ny, datareg, scancor=None):
-    """
-    Identify parts of the image that contain data and combine all images into a cube and a master image.
-    
-    Parameters:
-    -----------
-    flist : list;
-        List of filenames containing the data images.
-    
-    nx, ny : ints;
-        Size of the chip.
-        
-    datareg : list;
-        Borders in x and y pixels of the part of the chip that contains information.
-    
-    scancor : list;
-        If it exists, corrects for over- or under-scan regions.
-    """
-    n_files = len(flist)
-    border = get_border(scancor, nx)
-    
-    cube = np.empty([n_files, ny-border, nx])
-    for i in range(n_files):
-        image = fits.getdata(flist[i])
-        data_image = image[datareg[0]:datareg[1],datareg[2]:datareg[3]]
-
-        if scancor:
-            scan_region = image[scancor[0]:scancor[1],scancor[2]:scancor[3]]
-            scan_mean = robust.mean(scan_region, 3)
-            data_image = data_image - scan_mean
-        cube[i] = data_image
-        
-    sorted_cube = np.sort(cube,axis=0)
-    if n_files > 10:
-        master_image = np.mean(sorted_cube[3:-3],axis=0)
-    else:
-        master_image = np.mean(sorted_cube, axis=0)
-    
-    return master_image
-
 def fit_tophat(data, center, width, plot=False, title=''):
     """ Fit a tophat to the data given intial guessed parameters. """
     x = np.arange(len(data))
@@ -795,105 +1461,51 @@ def fit_tophat(data, center, width, plot=False, title=''):
     
     return t.x_0-t.width/2, t.x_0+t.width/2, t.amplitude.value
     
-def trace_slits(centers, widths, image):
-    """ Trace the borders of the slits in an image by fitting a tophat to each column. """
-    slit_top = centers + widths/2
-    slit_bottom = centers - widths/2
-    slit_flux = np.ones(len(slit_top))
-    
-    box_pars = np.zeros([image.shape[1],len(centers),3])
-    for i in range(len(centers)):
-        plt.ion()
-        for j in range(image.shape[1]):
-            col = image[:,j]
-            low = int(slit_bottom[i])-30
-            if low > 0:
-                col[0:low] = np.median(image[100:150]) # WHY THESE VALUES?
-            high = int(slit_top+30)
-            if high < image.shape[0]:
-                col[high:] = np.median(image[100:150])
-            box_pars[j,i] = fit_tophat(col, centers[i], widths[i], plot=True, title='Column '+str(j))
-            if box_pars[j,i][2]<1:
-                box_pars[j,i] = np.nan
-        plt.close()
-        plt.ioff()
-        
-        for j in range(3): #lower, upper, flux
-            clipped = stats.sigma_clip(box_pars[:,i,j], sigma=5, masked=True)
-            box_pars[:,i,j] = clipped.filled(np.nanmedian(box_pars[:,i,j]))
-            spl_func = scipy.interpolate.UnivariateSpline(np.arange(box_pars.shape[0]), box_pars[:,i,j]) #scipy.signal.medfilt(box_pars[:,i,j], kernel_size=101)
-            box_pars[:,i,j] = spl_func(np.arange(box_pars.shape[0]))
-    return box_pars.T
-
-def set_dark_zero(image, lower_bounds, upper_bounds):
-    """ Set areas outside the slits to 0 in the image, given the slit boundaries. """
-    ny, nx = image.shape
-    y_inds = np.arange(ny)
-    with0 = np.copy(image)
-    withNan = np.copy(image)
-    
-    for i in range(nx):
-        inslit = np.zeros(ny)
-        for j in range(lower_bounds.shape[0]):
-            inslit[np.where((y_inds>lower_bounds[j,i])&(y_inds<upper_bounds[j,i]))] = 1
-        with0[np.where(inslit==0),i] = 0.
-        withNan[np.where(inslit==0),i] = np.nan
-    
-    return with0, withNan
-
-def make_masterflat(flist, nx, ny, datareg, masterbias, slit_c, slit_w, scancor=None):
+def make_master_flat(flist, master_bias, calib_path=None, slit_centers=None, slit_width=None):
     """
-    Create a master flat image from the observed flat images.
+    Create a master flat from a list of input images.
     
     Parameters:
     -----------
     flist : list;
-        List of images to be included in the master flat.
+        List of flat images to be combined into the master flat.
         
-    nx, ny : ints;
-        Size of the images.
-        
-    datareg : list;
-        Boundaries of the area of the chip that contains information.
-        
-    masterbias : ndarray;
-        Master bias image.
-        
-    slit_c, slit_w : ints;
-        Estimated centers and widths of the slits in the images.
+    master_bias : Image;
+        Master bias image to subtract from the flat.
     
-    scancor : any, optional;
-        If values for the over- or under-scan region are given this is corrected for. Default is None.
+    calib_path : str, optional;
+        Path to save intermediate products if it is provided. Default is None.
+        
+    slit_centers : list, optional;
+        List of y-indices of the slits on the image. Default is None.
+    
+    slit_width : float, optional;
+        Width of the slits on the detector. Default is None.
     """
-    combined_flat = make_mastercube(flist, nx, ny, datareg, scancor)
-    masterflat = combined_flat - masterbias
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat_basicmaster.fits', masterflat, overwrite=True)
+    master_flat = master_image(flist)
+    master_flat.data = master_flat.data - master_bias.data
+    master_flat.update_slits(slit_centers, slit_width)
+    master_flat.get_slit_borders(plot=True)
+    master_flat.make_slit_map()
+    if calib_path:
+        fits.writeto(f'{calib_path}/flat_slit_map_{master_flat.chip_ind}.fits', master_flat.slit_map, overwrite=True)
+    master_flat.set_dark(dark = 0)
+    if calib_path:
+        fits.writeto(f'{calib_path}/flat0_{master_flat.chip_ind}.fits', master_flat.data, overwrite=True)
     
-    lower_bounds, upper_bounds, amplitudes = trace_slits(slit_c, slit_w, masterflat)
-    with0, withNan = set_dark_zero(masterflat, lower_bounds, upper_bounds)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat0.fits', with0, overwrite=True)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flatNan.fits', withNan, overwrite=True)
-    
-    flat_mean = robust.mean(withNan[np.where(np.isnan(withNan)==False)], 3)
-    norm_master = masterflat/flat_mean
-    norm0, normNan = set_dark_zero(norm_master, lower_bounds, upper_bounds)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat0_norm.fits', norm0, overwrite=True)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flatNan_norm.fits', normNan, overwrite=True)
-    
-    smooth10 = scipy.ndimage.median_filter(norm_master, size=10, mode='reflect')
-    smooth50 = scipy.ndimage.median_filter(norm_master, size=50, mode='reflect')
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat_smooth10.fits', smooth10, overwrite=True)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat_smooth50.fits', smooth50, overwrite=True)
-    
-    norm10 = norm_master/smooth10 #normalised flat divided by smoothed normalised flat is going to give only high frequency variations - is this present in IDL?
-    norm50 = norm_master/smooth50
-    norm010, normNan10 = set_dark_zero(norm10, lower_bounds, upper_bounds)
-    norm050, normNan50 = set_dark_zero(norm50, lower_bounds, upper_bounds)
-    fits.writeto('/Users/dominiquepetit/Documents/WASP-69/IDL_output/IDLpy_flat_final.fits', np.array([norm010,normNan10,norm050,normNan50]), overwrite=True)
-    
-    return normNan10, lower_bounds, upper_bounds
-
-
+    # Normalise the flat
+    flat_mean = robust.mean(master_flat.data[master_flat.slit_map == 1], 3)
+    master_flat.data = master_flat.data / flat_mean
+    if calib_path:
+        fits.writeto(f'{calib_path}/flatnorm_{master_flat.chip_ind}.fits', master_flat.data, overwrite=True)
+        
+    # Remove low frequency variations by removing a smoothed version of the flat
+    smoothed_data = scipy.ndimage.median_filter(master_flat.data, size=10, mode='reflect')
+    if calib_path:
+        fits.writeto(f'{calib_path}/flatsmooth_{master_flat.chip_ind}.fits', smoothed_data, overwrite=True)
+    master_flat.data = master_flat.data / smoothed_data
+    master_flat.set_dark(dark = 0)
+    return master_flat
 
 def onclick(event):
     """ Close plot after clicking. """
@@ -902,48 +1514,7 @@ def onclick(event):
     fig.canvas.mpl_disconnect(cid)
     plt.close()
     return
-    
-def click_plot(x1, y1, x2, xval, threshold=3e3, click_bool=False):
-    """
-    Show wavelength calibration plot and either identifies calibration lines by taking the closest line over the threshold for automatic calibration or prompts the user to click the indicated line for manual wavelength calibration.
-    
-    Parameters:
-    -----------
-    x1, y1 : ndarrays;
-        X and Y coordinates of the calibration spectrum.
         
-    x2 : float;
-        Estimated line position.
-        
-    xval : float;
-        Wavelength of the line that is to be identified.
-        
-    threshold : float, optional;
-        When using automatic calibration, the closest line with an intensity over the threshold is assumed to be the calibration line. Default is 3000.
-    
-    click_bool : bool, optional;
-        If True, manual calibration is done. Else automatic calibration. Default is False.
-    """
-    if click_bool:
-        global fig
-        global cid
-        
-        print('Click the line at',xval,'Å, or left of the data if line not shown')
-        fig = plt.figure()
-        fig.set_size_inches(10,5)
-        ax = fig.add_subplot(111)
-        ax.plot(x1,y1,color='k')
-        ax.scatter(x2,np.zeros(len(x2)),marker='x',color='r')
-        ax.axvline(xval,zorder=-10)
-        cid = fig.canvas.mpl_connect('button_press_event',onclick)
-        plt.show()
-    else:
-        line_inds = np.where(y1>threshold)[0] # was 3.3, double check both wavelength solutions
-        oldxval = np.argmin(np.abs(x1-xval))
-        newxval = np.argmin(np.abs(line_inds-oldxval))
-        global xvals
-        xvals.append(x1[line_inds[newxval]])
-    
 def fit_moffat(x,y, plot=False):
     """ Fit a Moffat function to a line and possibly show the result. """
     nan_vals = np.isnan(y)
@@ -987,57 +1558,6 @@ def robust_fit(x,y,order=3, f_scale=None):
     cs = res_robust.x
     return cs
 
-def new_solution(oldx, newx, allx, ally, inds=None, plot=False):
-    """ Calculate a new wavelength solution based on the location of spectral lines in the calibration file. """
-    if inds is not None:
-        if type(oldx)==list or type(newx)==list:
-            oldx = np.array(oldx)
-            newx = np.array(newx)
-        cs = robust_fit(oldx[inds],newx[inds],4)
-        if plot:
-            plt.scatter(oldx[inds],newx[inds],color='k')
-    else:
-        cs = robust_fit(oldx,newx,4) #np.polyfit(oldx, newx, 4)
-        if plot:
-            plt.scatter(oldx,newx,color='k')
-    
-    solution = np.polyval(cs,allx)
-    
-    if plot:
-        highres_x = np.linspace(oldx[0],oldx[-1],1000)
-        plt.plot(highres_x, np.polyval(cs,highres_x),color='r')
-        plt.show(block=False)
-        plt.pause(2)
-        plt.close()
-        plt.clf()
-        
-        plt.plot(solution,ally,color='k')
-        for l in newx: plt.axvline(l,color='green',zorder=-1)
-        plt.show(block=False)
-        plt.pause(5)
-        plt.close()
-        plt.clf()
-    
-    return solution
-
-def plot_window(x,y,lines):
-    """ Plot a section of the calibration spectrum. """
-    i, maxval = 0,0
-    plt.ion()
-    while maxval < np.max(x):
-        minval = np.min(x)+50*i
-        maxval = minval + 50
-        plt.plot(x,y,color='k')
-        [plt.axvline(l,color='green',zorder=-1) for l in lines]
-        plt.xlim([minval,maxval])
-        #plt.show(block=False)
-        plt.pause(.1)
-        #plt.close()
-        plt.clf()
-        i+=1
-    plt.close()
-    plt.ioff()
-
 def check_line_fit(fitted, wmin, wmax, amp, manual):
     """ Decide if the fit of a given line is reliable enough to include in the new wavelength solution. """
     if manual:
@@ -1052,229 +1572,6 @@ def check_line_fit(fitted, wmin, wmax, amp, manual):
         else:
             success = False
     return success
-
-def fitted_wavelengths(current_wave, theory_vals, window_width, spectrum, manual, print_status=False, mode='valid'):
-    """ Get the parameters of lines that have been accurately identified in the calibration image.
-    
-    Parameters:
-    -----------
-    current_wave : ndarray;
-        Wavelenght solution before calibration.
-        
-    theory_vals : ndarray;
-        Estimated line positions.
-        
-    window_width : int;
-        Width of region around the line where the fit is performed.
-        
-    spectrum : ndarray;
-        Calibration spectrum fluxes.
-        
-    manual : bool;
-        If True, calibration is done manually. If False, it is doen automatically.
-        
-    print_status : bool, optional;
-        If True, print progress statements.
-        
-    mode : str, optional;
-        If 'valid', badly fit lines are ignored. If 'same' they are included as NaNs.
-    """
-    fitted_x, fitted_l = [],[]
-    for j in range(len(theory_vals)):
-        ind_guess = np.argmin(np.abs(current_wave-theory_vals[j])) # Index of estimated line position
-        x_guess = current_wave[ind_guess] # Estimated line position
-        x_inds = np.where((current_wave>x_guess-window_width) & (current_wave<x_guess+window_width)) # Indices of points passed to fit
-        fit = fit_moffat(current_wave[x_inds],spectrum[x_inds],plot=print_status)
-        success = check_line_fit(fit, current_wave[x_inds[0][0]], current_wave[x_inds[0][-1]], 1e3, manual)
-        if success:
-            fitted_x = fitted_x + [fit.x_0.value]
-            fitted_l = fitted_l + [theory_vals[j]]
-            if print_status:
-                print('line at '+str(int(np.round(theory_vals[j])))+'Å added')
-        elif mode=='same':
-            fitted_x = fitted_x + [np.nan]
-            fitted_l = fitted_l + [np.nan]
-        elif print_status:
-            print('line at '+str(int(np.round(theory_vals[j])))+'Å skipped')
-    return fitted_x, fitted_l
-
-def solve_wave(arcfile, upper_bounds, lower_bounds, line_file, grism_file, nx, ny, slit_c, manual_mode=False, custom_list=None):
-    """
-    Create a wavelength solution for the calibration file.
-    A first solution is found based on a number of lines listed in the calibration file that can be identified either automatically or manually in the calibration spectrum.
-    This solution is further improved by fitting all the lines in the spectrum and then iterated over.
-    
-    Parameters:
-    -----------
-    arcfile : str;
-        Name of the file with the calibration spectrum.
-        
-    upper_bounds, lower_bounds : lists;
-        Slit boundaries.
-        
-    line_file : str;
-        Calibration file that has a list of identified lines.
-        
-    grism_file : str;
-        File containing the grism table.
-        
-    nx, ny : ints;
-        Size of images.
-    
-    slit_c : list;
-        Centers of the slits present in the image.
-        
-    manual_mode : bool, optional;
-        If True, calibrations are done manually. If False, they are done automatically. Default is False.
-    
-    custom_list : str, optional;
-        File containing a custom list of identifiable lines, to be used instead of ones specified in this function. Default is None.
-    """
-    n_slits = len(slit_c)
-    wmin, wmax, wstep = get_grism_parameters(grism_file)
-    waves = wmin+np.arange(nx)*wstep
-    line_waves, line_ions, line_sets = get_line_parameters(line_file)
-    if 'RI' in grism_file:
-        click_lines = [5460.75, 5875.82, 6096.16, 6929.47, 7245.17, 7948.18, 8264.52] #These lines are valid when the real solution is shifted to the right of the theoretical values. If reducing other data in this filter, check that this is still valid!
-        threshold = 3e3
-    elif 'B' in grism_file:
-        click_lines = [4046.56, 4678.1, 5085.8, 5460.75, 5875.62]
-        threshold = 2500
-    elif 'z' in grism_file:
-        click_lines = [7438.9, 7635.11, 7724.21, 7948.18,  9224.50, 9657.78]
-        threshold = 3e3
-    elif custom_list:
-        click_lines = np.loadtxt(custom_list)
-    else:
-        print("GRISM NOT SUPPORTED: please add a list of identifiable lines")
-        sys.exit()
-    solved_file = arcfile[:-4]+'lam.fits'
-    xval_array = np.zeros([n_slits,len(click_lines)]) # Real fitted x values of the clearest lines for every slit
-    data, header = fits.getdata(arcfile, header=True)
-    solved_image = np.zeros(data.shape)
-    rough_width = 20
-    peak_width = 30/header['ESO DET WIN1 BINY']
-    
-    # For every slit in the image:
-    for i in range(n_slits):
-        # Extract the spectrum from the data
-        rough_area = data[int(slit_c[i]-rough_width//2):int(slit_c[i]+rough_width//2)]
-        rough_spec = robust.mean(rough_area, 5., axis=0)
-        rough_err = np.sqrt(rough_spec)/np.sqrt(rough_width)
-        plt.plot(waves,rough_spec,color='k')
-        plt.axhline(threshold,color='green')
-        [plt.axvline(c,color='green') for c in click_lines]
-        plt.show(block=False)
-        plt.pause(5)
-        plt.close()
-        plt.clf()
-        # Obtain first wavelength solution based on identification of the lines in the click_lines list
-        global xvals # Global list to enable clicking in the plot
-        xvals = [] # Rough real x values of the clearest lines
-        for j in range(len(click_lines)):#,,
-            click_plot(waves, rough_spec, line_waves, click_lines[j], threshold=threshold, click_bool=manual_mode)
-            if xvals[j]<wmin or xvals[j]>wmax: # Replace invalid values with NaN
-                xvals[j] = np.nan
-            else: # Fit a Moffat function to find the real value
-                x_inds = np.where((waves>xvals[j]-peak_width) & (waves<xvals[j]+peak_width))
-                fit = fit_moffat(waves[x_inds],rough_spec[x_inds],plot=True)
-                xval_array[i,j] = fit.x_0.value
-        good_inds = np.where((xval_array[i]>wmin)&(xval_array[i]<wmax))[0]
-        first_solution = new_solution(xval_array[i], click_lines, waves, rough_spec, inds=good_inds, plot=True)
-        while(np.any(first_solution)<=0 or np.min(first_solution)<wmin-2000):
-            print('Wavelength calibration has failed. Please select the following lines by hand:')
-            for j in range(len(click_lines)):#,,
-                print(click_lines[j])
-                click_plot(waves, rough_spec, line_waves, click_lines[j], threshold=threshold, click_bool=True)
-                if xvals[j]<wmin or xvals[j]>wmax: # Replace invalid values with NaN
-                    xvals[j] = np.nan
-                else: # Fit a Moffat function to find the real value
-                    x_inds = np.where((waves>xvals[j]-peak_width) & (waves<xvals[j]+peak_width))
-                    fit = fit_moffat(waves[x_inds],rough_spec[x_inds],plot=True)
-                    xval_array[i,j] = fit.x_0.value
-            good_inds = np.where((xval_array[i]>wmin)&(xval_array[i]<wmax))[0]
-            first_solution = new_solution(xval_array[i], click_lines, waves, rough_spec, inds=good_inds, plot=True)
-            
-        
-        # Obtain second wavelength solution based on applying the first to all the lines available in the wavelength range of the data
-        line_inds = np.where((line_waves>first_solution[0])&(line_waves<first_solution[-1])) # Indices of all lines in the calculated real wavelength range
-        cut_lines = line_waves[line_inds]
-        cut_ions = line_ions[line_inds]
-        cut_sets = line_sets[line_inds]
-        xvals, lvals = fitted_wavelengths(first_solution, cut_lines, rough_width, rough_spec, manual_mode, print_status=True)
-        # Second iteration of wavelength solution, this time using all the succesfully fitted lines available. No need to specify indices, as xvals and lvals already only include lines where the fitting was succesful.
-        second_solution = new_solution(xvals, lvals, first_solution, rough_spec, plot=True)
-        
-        # Plot the spectrum in parts to see if calculated wavelengths of lines now match up with the data
-        plot_window(second_solution, rough_spec, lvals)
-        
-        # Obtain a wavelength solution for each row of pixels in the slit, to account for any potential tilted/curved lines
-        bottom_part_row = int(np.ceil(np.min(lower_bounds)))
-        bottom_full_row = int(np.ceil(np.max(lower_bounds)))
-        top_part_row = int(np.floor(np.max(upper_bounds)))
-        top_full_row = int(np.floor(np.min(upper_bounds)))
-        complete_rows = np.arange(bottom_full_row,top_full_row+1) #Rows of pixels in the slit that are complete. I.e. the whole row is taken up by slit pixels
-        partial_rows = np.append(np.arange(top_full_row+1,top_part_row+1), np.arange(bottom_part_row,bottom_full_row)) #+1 Rows that are only partially covered by the slit
-        n_complete = len(complete_rows)
-        line_positions = np.zeros([n_complete,len(lvals)]) # To be filled with the calculated line positions of each complete row, previously len(cut_lines) for second dimension
-        all_lines = np.zeros([ny,len(lvals)]) # Same but for all rows, so it can include partial rows
-        for j in range(n_complete):
-            row = data[complete_rows[j]]
-            line_positions[j], new_lvals = fitted_wavelengths(second_solution, lvals, rough_width, row, manual_mode, print_status=False, mode='same')  # rough_spec, where is row
-            new_lvals = np.array(new_lvals)
-            if len(line_positions[j][np.where(np.isfinite(line_positions[j]))]) > len(line_positions[j])/2:
-                third_solution = new_solution(line_positions[j][np.where(np.isfinite(line_positions[j]))], new_lvals[np.where(np.isfinite(new_lvals))], second_solution, row)
-            else:
-                third_solution = second_solution.copy()
-            all_lines[complete_rows[j]] = line_positions[j] # Line positions
-            solved_image[complete_rows[j]] = third_solution # Wavelength solution
-            print(j+1,'/',n_complete,end='\r')
-            
-        all_lines[np.where(all_lines==0)] = np.nan
-        
-        # Fit lines in the y direction with a polynomial to account for any potential tilted/curved lines
-        yfit_lines = np.zeros(all_lines.shape) # All_lines, because partial rows should be included
-        sigs = np.zeros(all_lines.shape[1])
-        plt.ion()
-        for j in range(all_lines.shape[1]):
-            inds = np.where(np.isfinite(all_lines[complete_rows,j]))
-            cs = robust_fit(complete_rows[inds], all_lines[complete_rows,j][inds], 3)
-            yfit_lines[complete_rows,j] = np.polyval(cs, complete_rows)
-            diff = yfit_lines[complete_rows,j]-all_lines[complete_rows,j]
-            sigs[j] = robust.std(diff[np.isfinite(diff)])
-            plt.scatter(all_lines[:,j],np.arange(ny),color='k')
-            plt.plot(yfit_lines[complete_rows,j], complete_rows, color='r')
-            plt.title('Arc line {0} fit in the y direction'.format(j))
-            plt.pause(.1)
-            plt.clf()
-        plt.close()
-        plt.ioff()
-            
-        clean_line_inds = np.where(sigs < 2*np.nanmedian(sigs))
-        solved_image[np.where(solved_image==0)] = np.nan
-        bad_count = 0
-        # Obtain final wavelength solution for each row, taking into account the fitted curvature of each line
-        for j in complete_rows:
-            wave_row = solved_image[j]
-            flux_row = data[j]
-            if np.sum(np.isnan(all_lines[j])) < len(all_lines[j])/2:
-                solved_image[j] = new_solution(all_lines[j], yfit_lines[j], wave_row, flux_row, inds=clean_line_inds, plot=False) #lvals, rough_spec, third_solution, inputs: oldx, newx, allx, ally,
-            else:
-                solved_image[j] = 0
-                bad_count += 1
-        if bad_count == 0:
-            print('Finding a wavelength solution was succesful for all rows.')
-        else:
-            print('Finding a wavelength solution was unsuccesful for {0} out of {1} rows.'.format(bad_count, len(complete_rows)))
-                
-        # Extrapolate line positions to rows of pixels that are only partially covered by the slit
-        for j in range(nx):
-            good_inds = np.where(solved_image[complete_rows,j]!=0)
-            cs = robust_fit(complete_rows[good_inds], solved_image[complete_rows,j][good_inds], 3)
-            solved_image[partial_rows,j] = np.polyval(cs, partial_rows)
-            solved_image[complete_rows,j] = np.polyval(cs,complete_rows)
-
-    return solved_image
 
 def linear_rebin(waves, spectrum, spec_error=None, wmin=None, wmax=None, wstep=None, conserve_flux=False):
     """ Linear interpolation of the spectrum from an old wavelength solution to a new one.
@@ -1329,25 +1626,8 @@ def linear_rebin(waves, spectrum, spec_error=None, wmin=None, wmax=None, wstep=N
         return new_spec, new_error
     else:
         return new_spec
-
-def adjust_2d(data, wavelength_solution, grism_file):
-    """ Change a 2D image to a new wavelength solution through line-by-line interpolation. """
-    wmin, wmax, wstep = get_grism_parameters(grism_file)
-    n_rows = data.shape[0]
-    n_columns = int(np.ceil((wmax-wmin)/wstep))
-    new_data = np.zeros([n_rows, n_columns])
     
-    for i in range(n_rows):
-        good_inds = np.where(np.isfinite(wavelength_solution[i])&np.isfinite(data[i]))
-        data_nonan = data[i][good_inds]
-        wave_solution_nonan = wavelength_solution[i][good_inds]
-        if len(wave_solution_nonan)>len(wavelength_solution[i])//2:
-            new_data[i] = linear_rebin(wave_solution_nonan, data_nonan, wmin=wmin, wmax=wmax, wstep=wstep, conserve_flux=False)
-        else:
-            new_data[i] = np.nan
-    return new_data
-    
-def make_masterarc(arclist, masterbias, nx, ny, slic, datareg, lower_bounds, upper_bounds, file_path, linecat, grism_file, master_file, scancor=None):
+def make_master_arc(arclist, master_bias, master_flat, linecat, grism_file, calib_path=None):
     """ Create a master calibration arc lamp file.
     
     Parameters:
@@ -1355,60 +1635,41 @@ def make_masterarc(arclist, masterbias, nx, ny, slic, datareg, lower_bounds, upp
     arclist : list;
         List of arclamp files to be included.
     
-    masterbias : ndarray;
+    masterbias : Image;
         Bias image.
         
-    nx, ny : ints;
-        Image size.
+    master_flat : Image;
+        Flat image.
         
-    slic : list;
-        Slit center locations.
-        
-    datareg : list;
-        Boundaries of the part of the chip where information is located.
-        
-    lower_bounds, upper_bounds : lists;
-        Boundaries of the slits on the detector.
-        
-    file_path : str;
-        Location of the arc lamp files.
-    
     linecat : str;
         Calibration line catalogue file name.
         
     grismfile : str;
         File name for grism table.
         
-    master_file : str;
-        Name of the master arc lamp file.
-        
-    scancor : list, optional;
-        If coordinates are given, corrects for over- or under-scan regions. Default is None.
+    calib_path : str, optional;
+        Folder to write intermediate product if given. Default is None.
     """
-    border = get_border(scancor, nx)
-    cor_arclist = [file_path+a.split('/')[-1][:-4]+'red.fits' for a in arclist]
+    master_arc_list = []
     for i in range(len(arclist)):
-        red_arc = make_mastercube([arclist[i]], nx, ny, datareg, scancor)
-        red_arc = red_arc - masterbias
-        arc0, arcNan = set_dark_zero(red_arc, lower_bounds, upper_bounds)
-    if len(arclist)>1:
-        master_arc = make_mastercube(cor_arclist, nx, ny, datareg, scancor)
-    else:
-        master_arc = arcNan
-    fits.writeto(master_file, master_arc, header=fits.getheader(arclist[0]), output_verify='ignore', overwrite=True)
-
-    wavelength_solution = solve_wave(master_file, upper_bounds, lower_bounds, linecat, grism_file, nx, ny, slic)
-    new_master_arc = adjust_2d(master_arc, wavelength_solution, grism_file)
+        master_arc = Image(arclist[i])
+        master_arc.adjust_image()
+        master_arc.data = master_arc.data - master_bias.data
+        master_arc.copy_slits(master_flat)
+        master_arc.set_dark(dark = np.nan)
+        master_arc_list = master_arc_list + [master_arc]
+    master_arc = master_image(master_arc_list)
+    if calib_path:
+        fits.writeto(f'{calib_path}/arc_combined.fits', master_arc.data, header=master_arc.header, output_verify='ignore', overwrite=True)
     
-    return wavelength_solution, new_master_arc
-            
-def write_steps(original, new_path, step1, step2, step3):
-    """ Write out intermediate reduction steps. """
-    hdr = fits.getheader(original)
-    new_file = new_path+original.split('/')[-1][:-4]
-    fits.writeto(new_file+'red.fits', step1, hdr, overwrite=True, output_verify='ignore')
-    fits.writeto(new_file+'redcos.fits', step2, hdr, overwrite=True, output_verify='ignore')
-    fits.writeto(new_file+'redcoslam.fits', step3, hdr, overwrite=True, output_verify='ignore')
+    master_arc.find_wavelength_solution(linecat, grism_file)
+    master_arc.adjust_2d()
+    return master_arc
+    
+def write_step(image, path, step):
+    """ Write an image to a fits file. """
+    new_file = f'{path}/{image.name[:-5]}'
+    fits.writeto(f'{new_file}_{step}.fits', image.data, image.header, overwrite=True, output_verify='ignore')
 
 def extract_moffat(data, sky_inds, y_inds, plot_bool=False):
     """
@@ -1500,56 +1761,13 @@ def thorough_smooth(data, size=50, sigma=3, plot=True):
         
     return new_data
     
-def fix_traces(waves, lower_bounds, upper_bounds, wmin, wmax, wstep):
-    """
-    Correct the boundaries of the traces on the detector for new wavelength solutions.
-    
-    Parameters:
-    -----------
-    waves : ndarray;
-        Wavelengths of the old wavelength solution.
-        
-    upper_bounds, lower_bounds : ndarrays;
-        Locations of the upper and lower bounds of the traces on the detector.
-        
-    wmin, wmax, wstep : ints;
-        Parameters for the new wavelength solutions.
-    """
-    new_bounds = [[], []]
-    for i in range(lower_bounds.shape[0]):
-        as_inds = np.array(np.round(lower_bounds[i]),dtype=int)
-        wave_int = np.array([waves[as_inds[i],i] for i in range(len(as_inds))])
-        good_inds = np.where(np.isfinite(wave_int)&np.isfinite(lower_bounds[i]))
-        new_lower = linear_rebin(wave_int[good_inds], lower_bounds[i][good_inds], wmin=wmin, wmax=wmax, wstep=wstep)
-        nnew = int(np.ceil((wmax-wmin)/wstep))
-        new_wave = wmin+wstep*np.arange(nnew)
-        int_func = scipy.interpolate.interp1d(new_wave[np.isfinite(new_lower)],new_lower[np.isfinite(new_lower)],'cubic',fill_value='extrapolate')
-        new_bounds[0] = new_bounds[0]+[int_func(new_wave)]
-        
-        as_inds = np.array(np.round(upper_bounds[i]),dtype=int)
-        wave_int = np.array([waves[as_inds[i],i] for i in range(len(as_inds))])
-        good_inds = np.where(np.isfinite(wave_int)&np.isfinite(upper_bounds[i]))
-        new_upper = linear_rebin(wave_int[good_inds], upper_bounds[i][good_inds], wmin=wmin, wmax=wmax, wstep=wstep)
-        int_func = scipy.interpolate.interp1d(new_wave[np.isfinite(new_upper)],new_upper[np.isfinite(new_upper)],'cubic',fill_value = 'extrapolate')
-        new_bounds[1] = new_bounds[1]+[int_func(new_wave)]
-    
-    return np.array(new_bounds)
-    
-def read_bounds(bound_files, dtype=float):
-    """ Read the locations of slit boundaries from a file. """
-    if type(bound_files) != list:
-        bound_files = [bound_files]
-    n_chips = len(bound_files)
-    lower_bounds = [None]*n_chips
-    upper_bounds = [None]*n_chips
-    for i in range(n_chips):
-        bounds = np.loadtxt(bound_files[i])#,dtype=dtype)
-        lower_bounds[i] = bounds[:,:bounds.shape[1]//2].T
-        upper_bounds[i] = bounds[:,bounds.shape[1]//2:].T
-    if len(bound_files) == 1:
-        lower_bounds = lower_bounds[0]
-        upper_bounds = upper_bounds[0]
-    return lower_bounds, upper_bounds
+def read_bounds(bound_file):
+    """ Read the upper and lower boundaries of slits from the provided file. """
+    cols = np.loadtxt(bound_file)
+    n_slits = cols.shape[1]//2
+    lower = [cols[:,i] for i in range(n_slits)]
+    upper = [cols[:,i+n_slits] for i in range(n_slits)]
+    return lower, upper
 
 def count_word(n):
     """ Make counting words for outputs. """
@@ -1563,124 +1781,18 @@ def count_word(n):
         suffix = 'th'
     return str(n)+suffix
     
-def bias(bias_files, nx, ny, datareg, scanreg):
-    """ Check if master biases already exist. If not, make them.
-    
-    Parameters:
-    -----------
-    bias_files : list;
-        List of files to be included in the master bias.
-        
-    nx, ny : ints;
-        Size of the chip.
-        
-    datareg : list;
-        Borders in x and y pixels of the part of the chip that contains information.
-    
-    scanreg : list;
-        Boundaries of the over- or under-scan regions.
-    """
-    n_chips = len(bias_files)
-    master_biases = [None]*n_chips
-    for i in range(n_chips):
-        master_file = impath+'masterbias{0}_py.fits'.format(i+1)
-        if not Path(master_file).is_file():
-            print('Creating {0} master bias...'.format(count_word(i+1)))
-            master_biases[i] = make_mastercube(bias_files[i], nx, ny, datareg, scanreg[i])
-            fits.writeto(master_file,master_biases[i])
-        else:
-            master_biases[i] = fits.getdata(master_file)
-    return master_biases
-    
-def flat(flat_files, nx, ny, datareg, master_biases, slic, swid, scanreg):
-    """
-    Check if master flats already exit. If not, make them.
-    
-    Parameters:
-    -----------
-    nx, ny : ints;
-        Size of the chip.
-        
-    datareg : list;
-        Borders in x and y pixels of the part of the chip that contains information.
-        
-    master_biases : list;
-        List of master bias files.
-        
-    slic, swid : ints;
-        Centers and widths of the slits on the chips.
-        
-    scanreg : list;
-        Boundaries of the over- or under-scan regions.
-    """
-    n_chips = len(flat_files)
-    master_flats = [None]*n_chips
-    lower,upper = [None]*n_chips,[None]*n_chips
-    for i in range(n_chips):
-        master_file = impath+'masterflat{0}_py.fits'.format(i+1)
-        if not Path(master_file).is_file():
-            print('Creating {0} master flat...'.format(count_word(i+1)))
-            normNan10, lower[i], upper[i] = make_masterflat(flat_files[i], nx, ny, datareg, master_biases[i], slic[i], swid[i], scanreg[i])
-            master_flats[i] = normNan10
-            fits.writeto(master_file, normNan10)
-            np.savetxt(impath+'bounds{0}.txt'.format(i+1),np.append(lower[i],upper[i],axis=0).T)
-        else:
-            master_flats[i] = fits.getdata(master_file)
-            lower[i], upper[i] = read_bounds(impath+'bounds{0}.txt'.format(i+1))
-    return master_flats, lower, upper
-
-def arc(arc_files, master_biases, nx, ny, slic, datareg, lower, upper, impath, linecat, gris_table, scanreg):
-    """
-    Check if the arc lamp files have already been reduced. If not, make them.
-    
-    Parameters:
-    -----------
-    arc_files : list;
-        List of files to be used for making the master arc file.
-        
-    master_biases : list;
-        Master bias files for both chips.
-        
-    nx, ny : ints;
-        Image size.
-        
-    slic : list;
-        List of centers for each column of each slit.
-        
-    datareg : list;
-        Boudaries of the area of the chip that contains the information.
-        
-    lower, upper : lists;
-        Lists of the slit boundaries.
-        
-    impath : str;
-        Location of the images.
-        
-    linecat : str;
-        FORS2 calibration file containing the line catalogue.
-        
-    gris_table : str;
-        FORS2 calibration file containg the grism information table.
-        
-    scanreg : list;
-        Over- or under-scan region boundaries on the chip.
-    """
-    n_chips = len(arc_files)
-    master_arcs = [None]*n_chips
-    lamda_solutions = [None]*n_chips
-    for i in range(n_chips):
-        master_file = impath+'masterarc{0}_py.fits'.format(i+1)
-        #print('MASTER FILE:', master_file)
-        if not Path(master_file[:-4]+'arccor.fits').is_file():
-            print('Creating {0} master arc image...'.format(count_word(i+1)))
-            lamda_solutions[i], master_arcs[i] = make_masterarc(arc_files[i], master_biases[i], nx, ny, slic[i], datareg, lower[i], upper[i], impath, linecat, gris_table, master_file, scanreg[i])
-            
-            fits.writeto(master_file[:-4]+'arccor.fits', master_arcs[i], overwrite=True)
-            fits.writeto(impath+'lamcal{0}_py.fits'.format(i+1), lamda_solutions[i], overwrite=True)
-        else:
-            master_arcs[i] = fits.getdata(master_file[:-4]+'arccor.fits'.format(i+1))
-            lamda_solutions[i] = fits.getdata(impath+'lamcal{0}_py.fits'.format(i+1))
-    return master_arcs, lamda_solutions
+def master_image(flist):
+    """ Create a master image of the provided files. """
+    if type(flist[0]) == np.str_:
+        frames = [Image(b) for b in flist]
+    else:
+        frames = flist
+    cube = Cube(frames)
+    cube.collapse_cube()
+    master = frames[0].copy()
+    master.image_type = 'master '+master.image_type
+    master.data = cube.collapsed
+    return master
     
 def calc_lc(stars, wave_range=None, targ_ind=0):
     """
@@ -1911,16 +2023,53 @@ def sort_files(data_path, out_path=None):
                 if len(file_names) != 0:
                     np.savetxt(f'{out_path}/{type}_images_{d}_{c}.txt', file_names, fmt='%s')
 
-#"""
+def get_slit_info(flist):
+    """ Get the y-indices of the slits and their width from an image. """
+    slit_centers = []
+    slit_widths = []
+    for i in range(len(flist)):
+        ims = [Image(f) for f in flist[i]]
+        cents = np.array([i.slit_centers for i in ims])
+        slit_centers = slit_centers + [list(np.mean(cents, axis=1, dtype=int)+[631,990][i])]
+        slit_widths = slit_widths + [np.mean([i.slit_width for i in ims])]
+    if len(slit_centers) == 1:
+        slit_centers = [slit_centers]
+    return slit_centers, slit_widths
+
+def wave_id_lines(grism, custom_list):
+    """ Return wavelengths of calibration lines to be used for first pass wavelength calibration based on the wavelength range of the observed data. Returns the wavelengths and an intensity threshold for automatic line identification.
+    
+    Parameters:
+    -----------
+    grism : str;
+        Name of the grism in which the observations are done.
+    
+    custom_list : list, optional;
+        List of custom lines to be used instead of the defaults if provided. Default is None.
+    """
+    if 'RI' in grism:
+        click_lines = [5460.75, 5875.82, 6096.16, 6929.47, 7245.17, 7948.18, 8264.52] #These lines are valid when the real solution is shifted to the right of the theoretical values. If reducing other data in this filter, check that this is still valid!
+        threshold = 3e3
+    elif 'B' in grism:
+        click_lines = [4046.56, 4678.1, 5085.8, 5460.75, 5875.62]
+        threshold = 2500
+    elif 'z' in grism_file:
+        click_lines = [7438.9, 7635.11, 7724.21, 7948.18,  9224.50, 9657.78]
+        threshold = 3e3
+    elif custom_list:
+        click_lines = np.loadtxt(custom_list)
+        threshold = 3e3
+    else:
+        raise ValueError('GRISM NOT SUPPORTED: please add a list of identifiable lines.')
+    return click_lines, threshold
+
 # Information about the data, to be input by the user
 target = 'WASP-69'
-grism = '600z_23' #'600RI_19' #'600z_23' #'600B_22' #
+grism = '600RI_19'
 band_name = grism.split('_')[0][3:]
-filter = find_filter(grism)#'GG435_81' #'OG590_32' #'free_00' #
+filter = find_filter(grism)
 n_chips = 2
-mask = 'A'
-date='08-19'
-
+date='2017-07-19'
 
 # File locations according to standard ESO pipeline installation
 static_calibration_path = '/opt/local/share/esopipes/datastatic/fors-5.5.7/'
@@ -1928,100 +2077,119 @@ gris_table = static_calibration_path + 'FORS2_GRS_{0}_{1}.fits'.format(grism,fil
 linecat = static_calibration_path + 'FORS2_ACAT_{0}_{1}.fits'.format(grism,filter)
 
 # Location of files containing lists of filenames of raw science/bias/flat/arc lamp frames
-impath = '/Volumes/TOSHIBAEXT/'+target+'/IDL_cals/'+band_name+'/'
-out_path = '/Volumes/TOSHIBAEXT/'+target+'/IDL_output/'+band_name+'/'
+impath = 'data'
+calib_path = f'calib_files'
+out_path = 'output_files'
 
 # Read the list of science/bias/flat/arc lamp files for both detectors
 print('Reading files...')
-sci_files = read_files(impath, 'science', band_name, mask, n_chips)
-bias_files = read_files(impath, 'bias', band_name, mask, n_chips)
-flat_files = read_files(impath, 'flat', band_name, mask, n_chips)
-arc_files = read_files(impath, 'arc', band_name, mask, n_chips)
+sort_files(impath)
+sci_files = read_files(impath, 'science', date, n_chips)
+bias_files = read_files(impath, 'bias', date, n_chips)
+flat_files = read_files(impath, 'flat', date, n_chips)
+arc_files = read_files(impath, 'arc', date, n_chips)
+slit_files = read_files(impath, 'slit', date, n_chips)
 
-# Use the first science file to obtain information about the detector
-nx, ny, gain, ron, scanreg, datareg, swid = get_detector_parameters(sci_files[0][0],sci_files[1][0], reference_y=996)
-# Estimate the slit centers by finding the brightest row on each detector.
-# This will have to be changed for detector images with multiple slits.
-slic = [np.array([np.argmax(np.sum(fits.getdata(sci_files[i][0]),axis=1))]) for i in range(2)]
-# Use the grism table to obtain wavelength information
-wmin, wmax, wstep = get_grism_parameters(gris_table)
-#"""
+# Iterative identification of slits based on the provided image.
+slit_centers, slit_widths = get_slit_info(slit_files)
 
-#"""
-# Calculaate master bias, flat and arclamp images.
-master_biases = bias(bias_files, nx, ny, datareg, scanreg)
-master_flats, lower, upper = flat(flat_files, nx, ny, datareg, master_biases, slic, swid, scanreg)
-master_arcs, lamda_solutions = arc(arc_files, master_biases, nx, ny, slic, datareg, lower, upper, impath, linecat, gris_table, scanreg)
+# Master biases
+master_biases = [None]*n_chips
+for i in range(n_chips):
+    master_file = f'{calib_path}/master_bias_chip{i+1}.fits'
+    if not Path(master_file).is_file():
+        print(f'Creating {count_word(i+1)} master bias...')
+        master_biases[i] = master_image(bias_files[i])
+        fits.writeto(master_file, master_biases[i].data, header=master_biases[i].header, output_verify='ignore')
+        master_biases[i].name = master_file
+    else:
+        master_biases[i] = Image(master_file)
 
+# Master flats
+master_flats = [None]*n_chips
+for i in range(n_chips):
+    master_file = f'{calib_path}/master_flat_chip{i+1}.fits'
+    if not Path(master_file).is_file():
+        print(f'Creating {count_word(i+1)} master flat.')
+        master_flats[i] = make_master_flat(flat_files[i], master_biases[i], calib_path, slit_centers[i], slit_widths[i])
+        fits.writeto(master_file, master_flats[i].data, header=master_flats[i].header, output_verify='ignore')
+        fits.writeto(f'{calib_path}/slit_map_chip{i+1}.fits', master_flats[i].slit_map, overwrite=True)
+        np.savetxt(f'{calib_path}/slit_bounds_chip{i+1}.dat', np.column_stack([master_flats[i].lower_bounds, master_flats[i].upper_bounds]))
+    else:
+        master_flats[i] = Image(master_file)
+        master_flats[i].update_slits(slit_centers[i], slit_widths[i])
+        master_flats[i].slit_map = fits.getdata(f'{calib_path}/slit_map_chip{i+1}.fits')
+        master_flats[i].lower_bounds, master_flats[i].upper_bounds = read_bounds(f'{calib_path}/slit_bounds_chip{i+1}.dat')
 
-#"""
+# Master arcs
+master_arcs = [None]*n_chips
+for i in range(n_chips):
+    master_file = f'{calib_path}/master_arc_chip{i+1}.fits'
+    if not Path(master_file).is_file():
+        print(f'Creating {count_word(i+1)} master arc image.')
+        master_arcs[i] = make_master_arc(arc_files[i], master_biases[i], master_flats[i], linecat, gris_table) # To use non-default lines, check out the wave_id_lines function.
+        fits.writeto(master_file, master_arcs[i].data, header=master_arcs[i].header, output_verify='ignore')
+        fits.writeto(f'{calib_path}/master_lam_chip{i+1}.fits', master_arcs[i].wavelength_solution, overwrite=True)
+    else:
+        master_arcs[i] = Image(master_file)
+        master_arcs[i].wavelength_solution = fits.getdata(f'{calib_path}/master_lam_chip{i+1}.fits')
 
-#"""
 n_files = len(sci_files[0]) # Number of integrations to be processed.
-nx_final = int(np.ceil((wmax-wmin)/wstep)) # X-axis length of the combined images.
-ny_final = [int(ny - get_border(scan, nx)) for scan in scanreg] # Y-axis length of the combined images.
-#"""
-
+write_steps = True # Write intermediate outputs.
 for i in range(n_files):
-    print('Creating 2D image {0}/{1} '.format(i+1,n_files)+sci_files[0][i][:-9].split('/')[-1])
-    print(sci_files[0][i])
-    new_data = np.zeros([np.sum(ny_final), nx_final])
-    new_bounds = [np.empty([n_chips,nx_final]),np.empty([n_chips,nx_final])]
-    header = fits.getheader(sci_files[0][i])
-    for j in range(n_chips):
-        header['ESO DET OUT{0} GAIN'.format(j+1)] = fits.getheader(sci_files[j][i])['ESO DET OUT1 GAIN']
-        header['ESO DET OUT{0} RON'.format(j+1)] = fits.getheader(sci_files[j][i])['ESO DET OUT1 RON']
-        
-        # Overscan corrected, bias and flat corrected image
-        image = make_mastercube([sci_files[j][i]], nx, ny, datareg, scanreg[j])
-        image = (image - master_biases[j])/master_flats[j]
-        
-        # Remove cosmic ray artefacts
-        clean_image, mask_image = lacosmic.lacosmic(image, contrast=1, cr_threshold=15, neighbor_threshold=5, effective_gain=gain[j], readnoise=ron[j], maxiter=4)
-        
-        # Wavelength calibration
-        lam_data = adjust_2d(clean_image, lamda_solutions[j], gris_table)
-        new_bounds[0][j], new_bounds[1][j] = fix_traces(lamda_solutions[j], lower[j], upper[j], wmin=wmin, wmax=wmax, wstep=wstep)
-        new_data[int(np.sum(ny_final[:j])):np.sum(ny_final[:j+1])] = lam_data
-        
-        # Create intermediate outputs. Here only for the first set of images to conserve disk space.
-        if i==0:
-            write_steps(sci_files[j][i], out_path, image, clean_image, lam_data)
-            np.savetxt(impath+'bounds{0}v2.txt'.format(j+1),np.column_stack([new_bounds[0][j].T, new_bounds[1][j].T]))#, fmt='%i'
+    print(f'Creating 2D image {i+1}/{n_files}: {sci_files[0][i][:-9].split("/")[-1]}')
     
-    # Write combined and calibrated images.
-    new_fname = out_path+'rcom/'+sci_files[0][i].split('/')[-1][:-4]+'rcom.fits'
-    fits.writeto(new_fname, new_data, header, output_verify='ignore', overwrite=True)
-#"""
+    sci_ims = [] # List of science images for each chip.
+    for j in range(n_chips):
+        sci_image = Image(sci_files[j][i]) # Read image
+        sci_image.adjust_image() # Overscan correction
+        sci_image.copy_slits(master_flats[j]) # Identify slits
+        sci_image.data = (sci_image.data - master_biases[j].data) / master_flats[j].data # Flat and bias correction
+        if write_steps:
+            write_step(sci_image, out_path, 'red')
+        
+        # Remove cosmic ray artefacts. These parameters need to be tuned to the data.
+        sci_image.data, mask_image = lacosmic.lacosmic(sci_image.data, contrast=1, cr_threshold=15, neighbor_threshold=5, effective_gain=sci_image.gain, readnoise=sci_image.read_noise, maxiter=4)
+        if write_steps:
+            write_step(sci_image, out_path, 'redcos')
 
-#"""
-# Place where combined files are located
-rcom_path = out_path+'rcom/'
-# Place to output final products.
-out_path_no_filt = '/'.join(out_path.split('/')[:-1])+'/'
+        # Wavelength calibration
+        sci_image.wavelength_solution = master_arcs[j].wavelength_solution
+        sci_image.get_wavelengths(gris_table)
+        sci_image.adjust_2d()
+        if write_steps:
+            write_step(sci_image, out_path, 'redcoslam')
+            
+        sci_ims = sci_ims + [sci_image]
+    
+    sci_image = sci_ims[0].combine_data(sci_ims[1]) # Combine data from different chips.
+    if i==0: # Write the new slit positions in the combined image.
+        np.savetxt(f'{calib_path}/slit_bounds_combined.dat', np.column_stack([sci_image.lower_bounds, sci_image.upper_bounds]))
+    write_step(sci_image, out_path, 'combined') # Write combined and calibrated images.
 
 # Define aperture sizes over which to extract the data.
 apertures = np.arange(25,75,5)
-np.savetxt(impath+'apertures.txt',apertures)
+np.savetxt(f'{calib_path}/apertures.txt',apertures)
 n_apertures = len(apertures)
 
 n_stars = 2 # Number of slits / sources in the combined image.
-combined_files = sorted(glob.glob(rcom_path+'*'+date+'*rcom.fits')) # Read the combined files.
+combined_files = sorted(glob.glob(f'{out_path}/*{date}*_combined.fits')) # Read the combined files.
 sky_region = np.array([13,33,247,267]) # Define the region within each slit to be used for sky background.
 
-# read slit boundaries from save file.
-bound_files = sorted(glob.glob(impath+'bounds*v2.txt'))
-lower, upper = read_bounds(bound_files, dtype=int)
-upper[1], lower[1] = np.array([upper[1],lower[1]])+np.sum(ny_final)//2 # Adjusted for being in the combined image.
+lower, upper = read_bounds(f'{calib_path}/slit_bounds_combined.dat') # read slit boundaries from save file.
 
 start_time = time.time() # Track duration of the source extraction/cleaning/alignment process.
 
 star_list = [] # List of extracted sources.
 for i in range(n_stars):
     # Create a source instance and extract the flux from the combined image files, then save.
-    star_n = Source(combined_files, nx_final, n_apertures, i, i, gris_table)
-    star_n.extract(combined_files, upper, lower, sky_region, apertures)
+    star_n = Source(combined_files, n_apertures, i+1, gris_table)
+    star_n.extract(upper[i], lower[i], sky_region, apertures)
     pickle.dump(star_n, file=open(f"{out_path}/extracted_{i}.pkl",'wb'))
+    
+"""
+This is where this example stops working, as it does not have enough science images included to do a proper outlier rejection in the cleaning.
+"""
     
     # Clean the flux and pick an order for the polynomial for the spectral realignment.
     # The cleaning threshold and the order are both dataset specific and require some fiddling to find the best solution.
@@ -2037,18 +2205,17 @@ for i in range(n_stars):
     pickle.dump(star_n, file=open(f"{out_path}/cleaned_{i}.pkl",'wb'))
     
     # Wavelength alignment and adding the source to the list of sources.
-    star_n.align_specs('/'.join(impath.split('/')[:-2])+'/', grism, align_order, print_stuff=False)
+    star_n.align_specs(calib_path, grism, align_order, print_stuff=False)
     star_list = star_list + [star_n]
     
     time_diff = int(np.around(time.time() - start_time))
     print('Processing {0} star(s) took {1} hours {2} minutes and {3} seconds.'.format(i+1,time_diff//3600, time_diff%3600//60, time_diff%60))
 
 # Write extracted sources to disk.
-pickle.dump(star_list, file=open(out_path_no_filt+'stars_'+band_name+'.pkl','wb'))
-#"""
+pickle.dump(star_list, file=open('{out_path}/stars_{band_name}.pkl','wb'))
 
 # Specify where light curves get stored. Create a new folder if necessary.
-lc_path = f'/Volumes/TOSHIBAEXT/Wasp-69/IDL_output/{band_name}/lcs/'
+lc_path = 'lcs'
 if not os.path.exists(lc_path):
     os.mkdir(lc_path)
     
@@ -2081,3 +2248,4 @@ for i in range(n_bins):
     
     n_str = '000'[:-len(str(i+1))]+str(i+1) # bin number
     np.savetxt(f'{lc_path}/bin{n_str}.dat', np.column_stack([lc_times, curve[best_arg], error[best_arg]]))
+
